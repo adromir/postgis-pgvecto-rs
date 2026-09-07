@@ -1,0 +1,156 @@
+name: Scheduled Build and Base Image Check
+
+on:
+  schedule:
+    # Runs every Monday at 03:00 UTC
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build and push even if base image has not changed'
+        type: boolean
+        default: false
+
+jobs:
+  check_and_build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      actions: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check upstream base image digest
+        id: check_base
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_IMAGE="postgres:17-trixie"
+          echo "Inspecting base image $BASE_IMAGE on linux/amd64..."
+
+          RAW_MANIFEST=$(docker buildx imagetools inspect --raw "$BASE_IMAGE")
+          CURRENT_DIGEST=$(echo "$RAW_MANIFEST" | jq -r '.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux") | .digest')
+
+          if [ -z "$CURRENT_DIGEST" ] || [ "$CURRENT_DIGEST" = "null" ]; then
+            echo "::error::Failed to extract digest for $BASE_IMAGE (amd64/linux)"
+            exit 1
+          fi
+
+          echo "Current upstream digest: $CURRENT_DIGEST"
+
+          PREV_DIGEST=""
+          if [ -f .base-image-digest ]; then
+            PREV_DIGEST=$(tr -d '[:space:]' < .base-image-digest)
+          fi
+          echo "Previous recorded digest: $PREV_DIGEST"
+
+          FORCE_BUILD="${{ inputs.force_build == true }}"
+
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "Force build requested via workflow_dispatch."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$CURRENT_DIGEST" != "$PREV_DIGEST" ]; then
+            echo "Base image has changed (upstream: $CURRENT_DIGEST, recorded: $PREV_DIGEST)."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Base image has not changed. Build skipped."
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "current_digest=$CURRENT_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Docker Hub
+        if: steps.check_base.outputs.needs_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        if: steps.check_base.outputs.needs_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        if: steps.check_base.outputs.needs_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/postgis-vectorchord:latest
+            ghcr.io/${{ github.repository_owner }}/postgis-vectorchord:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Docker Hub description
+        if: steps.check_base.outputs.needs_build == 'true'
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/postgis-vectorchord
+          readme-filepath: ./README.md
+
+      - name: Record updated base image digest
+        if: steps.check_base.outputs.needs_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.check_base.outputs.current_digest }}"
+          echo "$DIGEST" > .base-image-digest
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .base-image-digest
+          git commit -m "chore(ci): update base image digest to $DIGEST [skip ci]"
+          git pull --rebase origin main || true
+          git push origin main
+
+      - name: Keepalive Workflow (Prevent 60-day GitHub Inactivity Deactivation)
+        if: steps.check_base.outputs.needs_build != 'true'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          LAST_COMMIT_EPOCH=$(git log -1 --format=%ct)
+          CURRENT_EPOCH=$(date +%s)
+          DAYS_INACTIVE=$(( (CURRENT_EPOCH - LAST_COMMIT_EPOCH) / 86400 ))
+
+          echo "Days since last repository commit: $DAYS_INACTIVE"
+
+          if [ "$DAYS_INACTIVE" -ge 45 ]; then
+            echo "Repository has had no commits for $DAYS_INACTIVE days (threshold is 45)."
+            echo "Creating a keepalive commit to reset GitHub's 60-day scheduled workflow deactivation."
+
+            mkdir -p .github
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/.keepalive
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .github/.keepalive
+            git commit -m "chore(ci): keepalive scheduled workflow [skip ci]"
+            git pull --rebase origin main || true
+            git push origin main
+          else
+            echo "Repository activity is within the 45-day threshold. No keepalive commit needed."
+          fi
+
+          # Preemptively re-enable the workflow using GitHub API
+          echo "Ensuring scheduled workflow remains enabled via GitHub API..."
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/scheduled-build.yml/enable" || true
