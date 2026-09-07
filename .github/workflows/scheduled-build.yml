@@ -93,8 +93,12 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/postgis-vectorchord:latest
             ghcr.io/${{ github.repository_owner }}/postgis-vectorchord:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/postgis-vectorchord:buildcache
+            type=gha
+          cache-to: |
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/postgis-vectorchord:buildcache,mode=max
+            type=gha,mode=max
 
       - name: Update Docker Hub description
         if: steps.check_base.outputs.needs_build == 'true'

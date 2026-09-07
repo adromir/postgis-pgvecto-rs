@@ -44,8 +44,12 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/postgis-vectorchord:${{ inputs.tag }}
             ghcr.io/${{ github.repository_owner }}/postgis-vectorchord:${{ inputs.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/postgis-vectorchord:buildcache
+            type=gha
+          cache-to: |
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/postgis-vectorchord:buildcache,mode=max
+            type=gha,mode=max
 
       - name: Update Docker Hub description
         uses: peter-evans/dockerhub-description@v4
